@@ -35,3 +35,6 @@ with sync_playwright() as p:
         print("stats:", preview.get("stats", {}).keys())
     browser.close()
 python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+pip install playwright

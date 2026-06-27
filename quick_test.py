@@ -2,7 +2,7 @@ with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(user_agent=ua)
     page = context.new_page()
-    url = f"https://www.tiktok.com/@{lostblood1039}?lang=en"
+    url = f"https://www.tiktok.com/@{username}?lang=en"
     print(f"Opening {url} ...")
     try:
         page.goto(url, timeout=45000)

@@ -34,3 +34,4 @@ with sync_playwright() as p:
         print("createTime:", preview.get("createTime"))
         print("stats:", preview.get("stats", {}).keys())
     browser.close()
+python3 -m venv venv

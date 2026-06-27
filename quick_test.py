@@ -34,4 +34,6 @@ with sync_playwright() as p:
         print("createTime:", preview.get("createTime"))
         print("stats:", preview.get("stats", {}).keys())
     browser.close()python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activatepython -m pip install --upgrade pip
+pip install playwright
+python -m playwright install --with-deps

@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+TikTok deep scraper (single-file)
+- Defaults to username lostblood1039
+- Usage:
+    python scraper.py                # scrapes lostblood1039
+    python scraper.py otheruser      # scrapes otheruser
+    python scraper.py --no-download-media otheruser
+Notes:
+- Public profiles only.
+- Do not use this to bypass anti-abuse systems or access private data.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import string
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import httpx
+import yaml
+from tqdm import tqdm
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ----------------------
+# Config and utilities
+# ----------------------
+DEFAULT_CONFIG = {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "headless": True,
+    "scroll_pause_min": 0.8,
+    "scroll_pause_max": 1.6,
+    "max_scrolls": 40,
+    "rate_limit_delay_min": 0.5,
+    "rate_limit_delay_max": 1.5,
+    "download_concurrency": 3,
+    "download_timeout": 60,
+    "retry_attempts": 3,
+    "retry_backoff_base": 2.0,
+    "output_dir": "output",
+}
+
+
+def load_config(path: Optional[str]):
+    cfg = DEFAULT_CONFIG.copy()
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                user_cfg = yaml.safe_load(f) or {}
+            cfg.update(user_cfg)
+        except Exception:
+            print("[warn] failed to load config.yaml, using defaults")
+    else:
+        # try default filename
+        if os.path.exists("config.yaml"):
+            try:
+                with open("config.yaml", "r", encoding="utf-8") as f:
+                    user_cfg = yaml.safe_load(f) or {}
+                cfg.update(user_cfg)
+            except Exception:
+                pass
+    return cfg
+
+
+def safe_filename(s: str):
+    keep = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    return "".join(c if c in keep else "_" for c in s)[:200]
+
+
+def jitter_sleep(mins: float, maxs: float):
+    time.sleep(random.uniform(mins, maxs))
+
+
+# ----------------------
+# Extract embedded JSON
+# ----------------------
+SIGI_RE_1 = re.compile(r'<script[^>]*id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>', re.S | re.I)
+SIGI_RE_2 = re.compile(r"window\['SIGI_STATE'\]\s*=\s*(\{.*?\});", re.S | re.I)
+SIGI_RE_3 = re.compile(r"SIGI_STATE(?:=|:)\s*(\{.*?\})\s*;\s*$", re.S | re.I)
+
+
+def extract_sigi_state(html: str):
+    m = SIGI_RE_1.search(html)
+    if m:
+        txt = m.group(1).strip()
+        try:
+            return json.loads(txt)
+        except Exception:
+            txt2 = txt.replace("&quot;", '"').replace("&#x27;", "'")
+            try:
+                return json.loads(txt2)
+            except Exception:
+                pass
+    m2 = SIGI_RE_2.search(html)
+    if m2:
+        try:
+            return json.loads(m2.group(1))
+        except Exception:
+            pass
+    m3 = SIGI_RE_3.search(html)
+    if m3:
+        try:
+            return json.loads(m3.group(1))
+        except Exception:
+            pass
+    return None
+
+
+# ----------------------
+# Parse posts from state
+# ----------------------
+def collect_posts_from_state(state: dict):
+    # Try common locations for items
+    items = {}
+    try:
+        im = state.get("ItemModule") or {}
+        if isinstance(im, dict):
+            # Some variants: im may contain item objects directly, or an "items" dict
+            if "items" in im and isinstance(im["items"], dict):
+                items = im["items"]
+            else:
+                # collect numeric keys or all dict values that look like items
+                for k, v in im.items():
+                    if isinstance(v, dict) and ("id" in v or "desc" in v or "createTime" in v):
+                        items[k] = v
+    except Exception:
+        items = {}
+
+    # Fallback: older pages may have "aweme_list" or similar
+    if not items:
+        for key in ("aweme_list", "aweme", "itemList"):
+            if key in state and isinstance(state[key], dict):
+                items = state[key]
+                break
+
+    return items or {}
+
+
+def normalize_post(item_id: str, data: dict):
+    # Pull common fields with safe fallbacks
+    post = {}
+    post["id"] = item_id
+    post["desc"] = data.get("desc") or data.get("description") or data.get("title") or ""
+    # createTime sometimes as string or int
+    ct = data.get("createTime") or data.get("create_time")
+    try:
+        post["create_time"] = int(ct) if ct else None
+    except Exception:
+        post["create_time"] = None
+    # stats
+    stats = data.get("stats") or {}
+    post["stats"] = {
+        "diggCount": stats.get("diggCount") or stats.get("likes"),
+        "commentCount": stats.get("commentCount") or stats.get("comments"),
+        "shareCount": stats.get("shareCount") or stats.get("shares"),
+        "playCount": stats.get("playCount") or stats.get("views"),
+    }
+    # author/caption
+    author = data.get("author") or data.get("authorName") or data.get("authorUid") or data.get("authorId")
+    post["author"] = author
+    # video info
+    video = data.get("video") or {}
+    post["video"] = {}
+    if isinstance(video, dict):
+        post["video"]["play_addr"] = video.get("playAddr") or video.get("play_addr") or video.get("playUrl")
+        post["video"]["download_addr"] = video.get("downloadAddr") or video.get("download_addr")
+        post["video"]["duration"] = video.get("duration")
+        post["video"]["ratio"] = video.get("ratio")
+        post["video"]["width"] = video.get("width")
+        post["video"]["height"] = video.get("height")
+    # music / sound
+    music = data.get("music") or {}
+    post["music"] = {
+        "title": music.get("title"),
+        "author": music.get("author"),
+        "music_id": music.get("mid") or music.get("music_id"),
+    }
+    # hashtags (try to extract from text or from structured tag info)
+    hashtags = []
+    if "textExtra" in data and isinstance(data["textExtra"], list):
+        for x in data["textExtra"]:
+            if x.get("hashtagName"):
+                hashtags.append(x.get("hashtagName"))
+            elif x.get("type") in ("hashtag",) and x.get("hashtagName"):
+                hashtags.append(x.get("hashtagName"))
+    post["hashtags"] = hashtags
+    # raw item snapshot
+    post["_raw"] = data
+    return post
+
+
+# ----------------------
+# Download helpers
+# ----------------------
+def http_get_with_retries(url, client: httpx.Client, headers=None, timeout=60, retries=3, backoff_base=2.0):
+    for attempt in range(1, retries + 1):
+        try:
+            resp = client.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            if attempt == retries:
+                raise
+            backoff = backoff_base ** (attempt - 1)
+            time.sleep(backoff + random.random() * 0.5)
+    raise RuntimeError("unreachable")
+
+
+def download_video(url, out_path: Path, cfg, proxy: Optional[str], ua: str):
+    headers = {"User-Agent": ua, "Referer": "https://www.tiktok.com/"}
+    timeout = cfg.get("download_timeout", 60)
+    retries = cfg.get("retry_attempts", 3)
+    backoff_base = cfg.get("retry_backoff_base", 2.0)
+    proxies = None
+    # httpx supports proxies per client via env or param; pass proxy if provided
+    client_args = {"timeout": timeout}
+    if proxy:
+        client_args["proxies"] = {"all://": proxy}
+    with httpx.Client(**client_args) as client:
+        resp = http_get_with_retries(url, client, headers=headers, timeout=timeout, retries=retries, backoff_base=backoff_base)
+        # stream to file
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as fh:
+            fh.write(resp.content)  # small optimization: single write for most URLs
+
+# ----------------------
+# Main scraping logic
+# ----------------------
+def scrape_username(username: str, cfg: dict, download_media: bool = True, proxy: Optional[str] = None):
+    ua = cfg.get("user_agent")
+    headless = cfg.get("headless", True)
+    out_dir = Path(cfg.get("output_dir", "output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    media_dir = out_dir / "media" / username
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context_args = {"user_agent": ua}
+        # Playwright proxy argument must be passed at new_context level if needed
+        if proxy:
+            context_args["proxy"] = {"server": proxy}
+        context = browser.new_context(**context_args)
+        page = context.new_page()
+        url = f"https://www.tiktok.com/@{username}?lang=en"
+        print(f"[info] Opening {url}")
+        try:
+            page.goto(url, timeout=45000)
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except PlaywrightTimeoutError:
+            print("[warn] initial page load timed out; continuing to capture page content")
+
+        # perform scrolling to load items
+        max_scrolls = cfg.get("max_scrolls", 40)
+        pause_min = cfg.get("scroll_pause_min", 0.8)
+        pause_max = cfg.get("scroll_pause_max", 1.6)
+        last_height = page.evaluate("() => document.body.scrollHeight")
+        scrolls = 0
+        while scrolls < max_scrolls:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            jitter_sleep(pause_min, pause_max)
+            new_height = page.evaluate("() => document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+            scrolls += 1
+
+        html = page.content()
+        state = extract_sigi_state(html)
+        if not state:
+            # try a short retry load
+            print("[warn] Could not extract SIGI_STATE; retrying after short wait")
+            time.sleep(1.5)
+            html = page.content()
+            state = extract_sigi_state(html)
+        if not state:
+            # Save HTML for debugging and abort
+            debug_path = out_dir / f"{username}_page_debug.html"
+            debug_path.write_text(html, encoding="utf-8")
+            raise RuntimeError(f"Could not extract page state for @{username}. Saved debug HTML to {debug_path}")
+
+        # profile info
+        profile = {}
+        try:
+            um = state.get("UserModule", {}).get("users", {}) or {}
+            # keys may be username or userId
+            if username in um:
+                profile = um[username]
+            else:
+                # heuristic: pick first user with matching uniqueId
+                for v in um.values():
+                    if isinstance(v, dict) and v.get("uniqueId", "").lower() == username.lower():
+                        profile = v
+                        break
+        except Exception:
+            profile = {}
+
+        items = collect_posts_from_state(state)
+        print(f"[info] Found {len(items)} posts in embedded state")
+        posts = []
+        for item_id, item_data in items.items():
+            posts.append(normalize_post(item_id, item_data))
+
+        # limit ordering: try to preserve order from items keys (they are often newest-first)
+        # Download media if requested
+        if download_media:
+            print("[info] Downloading media (best-effort). This may fail if TikTok blocks direct video URLs.")
+            ua_header = ua
+            downloaded = 0
+            for p in tqdm(posts, desc="media", unit="file"):
+                # choose candidate URL: download_addr preferred then play_addr
+                v = p.get("video", {})
+                url_cand = None
+                for key in ("download_addr", "play_addr"):
+                    url_cand = v.get(key)
+                    if url_cand:
+                        # sometimes play_addr is a list or nested; attempt to extract string
+                        if isinstance(url_cand, list) and url_cand:
+                            url_cand = url_cand[0]
+                        break
+                if not url_cand:
+                    continue
+                # some URLs are escaped, replace unicode sequences
+                url_cand = url_cand.replace("\\u0026", "&") if isinstance(url_cand, str) else url_cand
+                if not url_cand or not url_cand.startswith("http"):
+                    continue
+                safe_name = f"{username}_{p['id']}.mp4"
+                out_path = media_dir / safe_filename(safe_name)
+                # skip if already exists
+                if out_path.exists() and out_path.stat().st_size > 100:
+                    p["_media_path"] = str(out_path)
+                    downloaded += 1
+                    continue
+                try:
+                    download_video(url_cand, out_path, cfg, proxy, ua_header)
+                    p["_media_path"] = str(out_path)
+                    downloaded += 1
+                except Exception as e:
+                    # warn and continue
+                    print(f"[warn] failed to download media for post {p['id']}: {e}")
+                # respect rate limit between downloads
+                jitter_sleep(cfg.get("rate_limit_delay_min", 0.5), cfg.get("rate_limit_delay_max", 1.5))
+            print(f"[info] Downloaded {downloaded} media files (or found cached)")
+
+        # write JSONL output
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        out_jsonl = Path(cfg.get("output_dir", "output")) / f"{username}_{ts}.jsonl"
+        with open(out_jsonl, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"_meta": {"username": username, "scraped_at": ts, "profile": profile}}, ensure_ascii=False) + "\n")
+            for p in posts:
+                # remove bulky raw if you prefer; keep it here for depth
+                fh.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+        page.close()
+        context.close()
+        browser.close()
+
+    return {"username": username, "profile": profile, "posts_count": len(posts), "output_file": str(out_jsonl)}
+
+
+# ----------------------
+# CLI
+# ----------------------
+def main():
+    parser = argparse.ArgumentParser(description="TikTok deep scraper (single-file). Defaults to lostblood1039")
+    parser.add_argument("usernames", nargs="*", help="TikTok username(s) (no @). If omitted defaults to lostblood1039", default=[])
+    parser.add_argument("--no-download-media", action="store_true", help="Do not download video files")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.yaml (optional)")
+    parser.add_argument("--proxy", type=str, default=None, help="HTTP(S) proxy like http://user:pass@host:port (optional)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    download_media = not args.no_download_media
+
+    usernames = args.usernames or ["lostblood1039"]
+    results = []
+    for u in usernames:
+        try:
+            print(f"[run] scraping @{u} ...")
+            res = scrape_username(u, cfg, download_media=download_media, proxy=args.proxy)
+            print(f"[ok] scraped @{u}: {res['posts_count']} posts -> {res['output_file']}")
+            results.append(res)
+            # small pause between users
+            jitter_sleep(cfg.get("rate_limit_delay_min", 0.5), cfg.get("rate_limit_delay_max", 1.5))
+        except Exception as e:
+            print(f"[error] failed to scrape @{u}: {e}")
+
+    print("[done] All done.")
+    for r in results:
+        print(r)
+
+if __name__ == "__main__":
+    main()

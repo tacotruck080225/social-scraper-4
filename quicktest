@@ -1,4 +1,7 @@
-with sync_playwright() as p:
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+pip install playwrightwith sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(user_agent=ua)
     page = context.new_page()

@@ -1,0 +1,36 @@
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(user_agent=ua)
+    page = context.new_page()
+    url = f"https://www.tiktok.com/@{username}?lang=en"
+    print(f"Opening {url} ...")
+    try:
+        page.goto(url, timeout=45000)
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except TimeoutError:
+        print("Page load timed out; site may block automated requests.")
+    html = page.content()
+    state = extract_sigi_state(html)
+    if not state:
+        print("Could not find SIGI_STATE in page HTML. TikTok may have blocked or changed the page.")
+        (out_dir / f"{username}_page.html").write_text(html, encoding="utf-8")
+        print(f"Saved page HTML to {out_dir / (username + '_page.html')}")
+        browser.close()
+        return
+    out_file = out_dir / f"{username}_sigi_state.json"
+    out_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Saved SIGI_STATE JSON to {out_file}")
+    item_module = state.get("ItemModule", {})
+    items = {}
+    if isinstance(item_module, dict):
+        items = item_module.get("items", item_module) if item_module else {}
+    posts_count = len(items) if isinstance(items, dict) else 0
+    print(f"Found ItemModule posts: {posts_count}")
+    if posts_count:
+        first_id = next(iter(items.keys()))
+        print("First post id:", first_id)
+        preview = items[first_id]
+        print("desc:", preview.get("desc"))
+        print("createTime:", preview.get("createTime"))
+        print("stats:", preview.get("stats", {}).keys())
+    browser.close()
